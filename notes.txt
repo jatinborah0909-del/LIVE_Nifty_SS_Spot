@@ -1,0 +1,4 @@
+base.py file is already working. I am making a small modification to write to database when ever the new trade is taken instead of writing after 30sec. 
+In this case I will know immediately if my entry price is correct.
+
+Adding refresh token concept so that the token refresh everyday
