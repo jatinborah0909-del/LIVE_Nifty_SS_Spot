@@ -18,13 +18,16 @@ What it does:
 - Exit:
   - Profit target / circuit stoploss / 15:25 square-off / kill-switch OFF => square off legs
 - All logs go to Postgres table: Live_SS_Nifty_Spot (NO CSV)
+
+ NO API calls / DB writes:
+    - before 09:15
+    - after 15:30
+    - weekends
+    - exchange holidays
 """
 
-import os
-import time
-import math
+import os, time, math
 from datetime import datetime, timedelta, time as dt_time, date
-
 import pytz
 import requests
 import psycopg2
@@ -35,90 +38,104 @@ from kiteconnect import KiteConnect
 # ENV HELPERS
 # =========================================================
 
-def env_bool(k: str, d: bool = False) -> bool:
-    return os.getenv(k, str(d)).strip().lower() in ("1", "true", "yes", "y", "on")
+def env_bool(k, d=False):
+    return os.getenv(k, str(d)).lower() in ("1","true","yes","y","on")
 
-def env_int(k: str, d: int) -> int:
-    try:
-        return int(os.getenv(k, str(d)).strip())
-    except Exception:
-        return d
+def env_int(k, d):
+    try: return int(os.getenv(k, d))
+    except: return d
 
-def env_float(k: str, d: float) -> float:
-    try:
-        return float(os.getenv(k, str(d)).strip())
-    except Exception:
-        return d
+def env_float(k, d):
+    try: return float(os.getenv(k, d))
+    except: return d
 
-def parse_hhmm(key: str, default: str) -> dt_time:
-    s = os.getenv(key, default).strip()
-    try:
-        hh, mm = s.split(":")
-        return dt_time(int(hh), int(mm))
-    except Exception:
-        raise ValueError(f"{key} must be HH:MM (e.g. {default}). Got: {s!r}")
+def parse_hhmm(key, default):
+    s = os.getenv(key, default)
+    hh, mm = s.split(":")
+    return dt_time(int(hh), int(mm))
 
 # =========================================================
-# CONFIG (ENV)
+# CONFIG
 # =========================================================
 
 BOT_NAME = os.getenv("BOT_NAME", "SS_NIFTY_SPOT")
-
 MARKET_TZ = pytz.timezone(os.getenv("MARKET_TZ", "Asia/Kolkata"))
+
+MARKET_OPEN_TIME  = parse_hhmm("MARKET_OPEN_TIME",  "09:15")
+MARKET_CLOSE_TIME = parse_hhmm("MARKET_CLOSE_TIME", "15:30")
+ENTRY_START_TIME  = parse_hhmm("ENTRY_START_TIME",  "09:30")
+SQUARE_OFF_TIME   = parse_hhmm("SQUARE_OFF_TIME",   "15:25")
+
+ENTRY_TOL   = env_int("ENTRY_TOL", 4)
+STRIKE_STEP = env_int("STRIKE_STEP", 50)
+QTY_PER_LEG = env_int("QTY_PER_LEG", 65)
+
+PROFIT_TARGET     = env_float("PROFIT_TARGET", 0.0)
+CIRCUIT_STOP_LOSS = env_float("CIRCUIT_STOP_LOSS", 0.0)
+
+SNAPSHOT_INTERVAL_SEC = env_int("SNAPSHOT_INTERVAL_SEC", 60)
+POLL_INTERVAL_SEC     = env_int("POLL_INTERVAL_SEC", 1)
+
+SPOT_INSTRUMENT = os.getenv("SPOT_INSTRUMENT", "NSE:NIFTY 50")
+
+ATR_INSTRUMENT_TOKEN = env_int("ATR_INSTRUMENT_TOKEN", 0)
+ATR_PERIOD = env_int("ATR_PERIOD", 14)
 
 LIVE_MODE = env_bool("LIVE_MODE", False)
 
-# Strategy params
-ENTRY_START_TIME = parse_hhmm("ENTRY_START_TIME", "09:30")
-ENTRY_TOL        = env_int("ENTRY_TOL", 4)
-STRIKE_STEP      = env_int("STRIKE_STEP", 50)
-QTY_PER_LEG      = env_int("QTY_PER_LEG", 65)
+KITE_API_KEY      = os.getenv("KITE_API_KEY")
+KITE_ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN")
 
-# Risk params
-PROFIT_TARGET     = env_float("PROFIT_TARGET", 0.0)      # 0 disables
-CIRCUIT_STOP_LOSS = env_float("CIRCUIT_STOP_LOSS", 0.0)  # 0 disables
+STOCKO_ACCESS_TOKEN = os.getenv("STOCKO_ACCESS_TOKEN")
+STOCKO_CLIENT_ID    = os.getenv("STOCKO_CLIENT_ID")
+STOCKO_BASE_URL     = os.getenv("STOCKO_BASE_URL", "https://api.stocko.in")
 
-# Time exits / loops
-SQUARE_OFF_TIME         = parse_hhmm("SQUARE_OFF_TIME", "15:25")
-POLL_INTERVAL_SEC       = env_int("POLL_INTERVAL_SEC", 1)
-SNAPSHOT_INTERVAL_SEC   = env_int("SNAPSHOT_INTERVAL_SEC", 60)
+# =========================================================
+# HOLIDAY / MARKET SESSION GUARDS
+# =========================================================
 
-# Instruments
-SPOT_INSTRUMENT = os.getenv("SPOT_INSTRUMENT", "NSE:NIFTY 50")
+# 👉 NSE holidays (MAINTAIN YEARLY)
+NSE_HOLIDAYS = {
+    date(2026, 1, 26),   # Republic Day
+    date(2026, 3, 6),    # Holi (example)
+    date(2026, 3, 31),   # Ram Navami (example)
+    date(2026, 4, 10),   # Good Friday
+    date(2026, 5, 1),    # Maharashtra Day
+    date(2026, 8, 15),   # Independence Day
+    date(2026, 10, 2),   # Gandhi Jayanti
+    date(2026, 11, 12),  # Diwali (example)
+}
 
-# ATR
-ATR_INSTRUMENT_TOKEN = env_int("ATR_INSTRUMENT_TOKEN", 0)  # REQUIRED (e.g., NIFTY index token)
-ATR_PERIOD           = env_int("ATR_PERIOD", 14)
+def is_weekend(d):
+    return d.weekday() >= 5   # Sat/Sun
 
-# Kite creds
-KITE_API_KEY      = os.getenv("KITE_API_KEY", "").strip()
-KITE_ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", "").strip()
+def is_holiday(d):
+    return d in NSE_HOLIDAYS
 
-# Stocko (LIVE only)
-STOCKO_BASE_URL     = os.getenv("STOCKO_BASE_URL", "https://api.stocko.in").strip()
-STOCKO_ACCESS_TOKEN = os.getenv("STOCKO_ACCESS_TOKEN", "").strip()
-STOCKO_CLIENT_ID    = os.getenv("STOCKO_CLIENT_ID", "").strip()
+def is_market_session_open(now):
+    if is_weekend(now.date()):
+        return False
+    if is_holiday(now.date()):
+        return False
+    return MARKET_OPEN_TIME <= now.time() <= MARKET_CLOSE_TIME
 
 # =========================================================
 # DB
 # =========================================================
 
-TABLE_TRADES = "Live_SS_Nifty_Spot"
-FLAG_TABLE   = "trade_flag"
-FLAG_COL     = "live_ss_nifty_spot"  # as you specified (boolean)
-
 def db_connect():
-    url = os.getenv("DATABASE_URL", "").strip()
-    if not url:
-        raise ValueError("DATABASE_URL env variable is missing.")
-    return psycopg2.connect(url, sslmode="require", cursor_factory=RealDictCursor)
+    return psycopg2.connect(
+        os.getenv("DATABASE_URL"),
+        sslmode="require",
+        cursor_factory=RealDictCursor
+    )
 
 def ensure_table(conn):
     with conn.cursor() as c:
-        c.execute(f"""
-        CREATE TABLE IF NOT EXISTS {TABLE_TRADES} (
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS Live_SS_Nifty_Spot (
             id SERIAL PRIMARY KEY,
-            ts TIMESTAMPTZ NOT NULL,
+            ts TIMESTAMPTZ,
             bot_name TEXT,
             mode TEXT,
             event TEXT,
@@ -135,415 +152,110 @@ def ensure_table(conn):
         """)
     conn.commit()
 
-def log_db(conn, *, event, reason, symbol, side, qty, price, spot, atr, unreal, total):
+def log_db(conn, **k):
     with conn.cursor() as c:
-        c.execute(f"""
-            INSERT INTO {TABLE_TRADES}
-            (ts, bot_name, mode, event, reason, symbol, side, qty, price, spot, atr, unreal_pnl, total_pnl)
-            VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        c.execute("""
+        INSERT INTO Live_SS_Nifty_Spot
+        (ts, bot_name, mode, event, reason, symbol, side, qty, price, spot, atr, unreal_pnl, total_pnl)
+        VALUES (NOW(), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             BOT_NAME,
             "LIVE" if LIVE_MODE else "PAPER",
-            str(event),
-            str(reason),
-            str(symbol),
-            str(side),
-            int(qty),
-            float(price) if price is not None else 0.0,
-            float(spot) if spot is not None else 0.0,
-            float(atr) if atr is not None else None,
-            float(unreal) if unreal is not None else 0.0,
-            float(total) if total is not None else 0.0
+            k["event"], k["reason"], k["symbol"], k["side"],
+            k["qty"], k["price"], k["spot"], k["atr"],
+            k["unreal"], k["total"]
         ))
     conn.commit()
 
-def read_trade_flag(conn) -> bool:
-    # Expect exactly 1 row in trade_flag
+def read_trade_flag(conn):
     with conn.cursor() as c:
-        c.execute(f"SELECT {FLAG_COL} FROM {FLAG_TABLE} LIMIT 1")
+        c.execute("SELECT live_ss_nifty_spot FROM trade_flag LIMIT 1")
         r = c.fetchone()
-        return bool(r[FLAG_COL]) if r and (FLAG_COL in r) else False
+        return bool(r["live_ss_nifty_spot"]) if r else False
 
 # =========================================================
-# KITE / MARKET DATA
+# MARKET / ATR
 # =========================================================
 
-def kite_connect() -> KiteConnect:
-    if not KITE_API_KEY or not KITE_ACCESS_TOKEN:
-        raise ValueError("KITE_API_KEY or KITE_ACCESS_TOKEN missing in env.")
+def kite_connect():
     k = KiteConnect(api_key=KITE_API_KEY)
     k.set_access_token(KITE_ACCESS_TOKEN)
     return k
 
-def safe_ltp(kite: KiteConnect, instrument: str) -> float:
-    try:
-        q = kite.ltp(instrument)
-        return float(q[instrument]["last_price"])
-    except Exception:
-        return float("nan")
+def ltp(k, inst):
+    try: return k.ltp(inst)[inst]["last_price"]
+    except: return float("nan")
 
-def compute_atr(kite: KiteConnect) -> float | None:
-    """
-    ATR(ATR_PERIOD) from 1-minute candles using TR average.
-    Always computed every snapshot minute, regardless of trading permission.
-    """
+def compute_atr(k):
     if ATR_INSTRUMENT_TOKEN <= 0:
         return None
-
     now = datetime.now(MARKET_TZ)
     start = now - timedelta(minutes=ATR_PERIOD + 10)
-
-    try:
-        candles = kite.historical_data(ATR_INSTRUMENT_TOKEN, start, now, "minute")
-    except Exception:
+    candles = k.historical_data(ATR_INSTRUMENT_TOKEN, start, now, "minute")
+    if len(candles) < ATR_PERIOD + 1:
         return None
-
-    if not candles or len(candles) < ATR_PERIOD + 1:
-        return None
-
     trs = []
     for i in range(1, len(candles)):
-        h = candles[i]["high"]
-        l = candles[i]["low"]
-        pc = candles[i - 1]["close"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-
-    atr = sum(trs[-ATR_PERIOD:]) / ATR_PERIOD
-    return round(float(atr), 2)
-
-# =========================================================
-# INSTRUMENT RESOLUTION (NIFTY CE/PE for nearest expiry)
-# =========================================================
-
-def pick_nearest_expiry_nifty_options(kite: KiteConnect):
-    """
-    Fetch NFO instruments once and return a list filtered for NIFTY options.
-    This is heavy; do once at startup.
-    """
-    inst = kite.instruments("NFO")
-    # Filter NIFTY options only
-    nifty_opts = [
-        r for r in inst
-        if r.get("segment") == "NFO-OPT"
-        and r.get("name") == "NIFTY"
-        and r.get("instrument_type") in ("CE", "PE")
-    ]
-    if not nifty_opts:
-        raise RuntimeError("Could not find NIFTY options in NFO instruments.")
-    return nifty_opts
-
-def resolve_atm_ce_pe(nifty_opts, atm_strike: int, today: date):
-    """
-    Choose nearest expiry >= today, and find CE+PE at that strike.
-    Returns (ce_row, pe_row).
-    """
-    expiries = sorted({r["expiry"] for r in nifty_opts if r["expiry"] >= today})
-    if not expiries:
-        raise RuntimeError("No upcoming NIFTY option expiries found.")
-
-    expiry = expiries[0]  # nearest expiry
-
-    ce = next((r for r in nifty_opts if r["expiry"] == expiry and r["strike"] == atm_strike and r["instrument_type"] == "CE"), None)
-    pe = next((r for r in nifty_opts if r["expiry"] == expiry and r["strike"] == atm_strike and r["instrument_type"] == "PE"), None)
-
-    if not ce or not pe:
-        raise RuntimeError(f"Could not resolve CE/PE for strike={atm_strike} expiry={expiry}.")
-
-    return ce, pe, expiry
-
-# =========================================================
-# STOCKO ORDER PLACEMENT (LIVE) / PAPER SIMULATION
-# =========================================================
-
-def stocko_place(symbol: str, side: str, qty: int) -> str:
-    """
-    Live mode: place order via Stocko.
-    Paper mode: return empty string (no crash if creds missing).
-    """
-    if not LIVE_MODE:
-        return ""
-
-    if not STOCKO_ACCESS_TOKEN or not STOCKO_CLIENT_ID:
-        raise RuntimeError("LIVE_MODE=True but STOCKO_ACCESS_TOKEN / STOCKO_CLIENT_ID missing.")
-
-    url = f"{STOCKO_BASE_URL}/orders"
-    headers = {
-        "Authorization": f"Bearer {STOCKO_ACCESS_TOKEN}",
-        "X-Client-Id": STOCKO_CLIENT_ID,
-        "Content-Type": "application/json"
-    }
-    payload = {"symbol": symbol, "side": side, "quantity": qty, "order_type": "MARKET"}
-    r = requests.post(url, headers=headers, json=payload, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    return str(data.get("order_id", ""))
-
-# =========================================================
-# POSITION & PNL
-# =========================================================
-
-def compute_unreal_m2m(kite: KiteConnect, positions: dict) -> float:
-    """
-    positions: dict with keys "CE","PE" each has:
-      - instrument (e.g. "NFO:NIFTY24JAN25000CE")
-      - side ("SELL")
-      - qty
-      - entry_price
-    For SELL: pnl = (entry - ltp) * qty
-    """
-    unreal = 0.0
-    for leg in positions.values():
-        inst = leg["instrument"]
-        ltp = safe_ltp(kite, inst)
-        if math.isnan(ltp):
-            continue
-        entry = float(leg["entry_price"])
-        qty = int(leg["qty"])
-        side = leg["side"].upper()
-        if side == "SELL":
-            unreal += (entry - ltp) * qty
-        else:
-            unreal += (ltp - entry) * qty
-    return float(unreal)
-
-def square_off_all(conn, kite: KiteConnect, positions: dict, *, spot: float, atr: float | None, reason: str, event: str = "EXIT_ALL"):
-    """
-    Exit both legs (if present) and log each transaction + one summary row.
-    """
-    if not positions:
-        return
-
-    # Exit each leg
-    for leg_name in list(positions.keys()):
-        leg = positions[leg_name]
-        inst = leg["instrument"]
-        tradingsymbol = leg["tradingsymbol"]
-        qty = int(leg["qty"])
-
-        # For short straddle SELL entry, exit is BUY
-        exit_side = "BUY" if leg["side"].upper() == "SELL" else "SELL"
-
-        exit_price = safe_ltp(kite, inst)
-        if math.isnan(exit_price):
-            exit_price = 0.0
-
-        if LIVE_MODE:
-            stocko_place(tradingsymbol, exit_side, qty)
-
-        # Log exit transaction
-        unreal = compute_unreal_m2m(kite, positions)
-        total = unreal
-        log_db(
-            conn,
-            event="EXIT",
-            reason=reason,
-            symbol=inst,
-            side=exit_side,
-            qty=qty,
-            price=exit_price,
-            spot=spot,
-            atr=atr,
-            unreal=unreal,
-            total=total
-        )
-
-        positions.pop(leg_name, None)
-
-    # Summary row
-    log_db(
-        conn,
-        event=event,
-        reason=reason,
-        symbol="ALL",
-        side="NA",
-        qty=0,
-        price=0,
-        spot=spot,
-        atr=atr,
-        unreal=0.0,
-        total=0.0
-    )
-
-# =========================================================
-# STRATEGY: ATM SHORT STRADDLE ENTRY LOGIC
-# =========================================================
-
-def strategy_signal(now_local: dt_time, spot: float, positions: dict) -> dict:
-    """
-    Returns:
-      { action: "ENTER"|"HOLD", reason: str }
-    """
-    # Entry only after configured time
-    if now_local < ENTRY_START_TIME:
-        return {"action": "HOLD", "reason": f"BEFORE_ENTRY_START_{ENTRY_START_TIME.strftime('%H:%M')}"}
-
-    # Only one position at a time
-    if positions:
-        return {"action": "HOLD", "reason": "POSITION_OPEN"}
-
-    # ATM strike rounding
-    atm = int(round(spot / STRIKE_STEP) * STRIKE_STEP)
-
-    # Entry threshold check (± ENTRY_TOL)
-    if abs(spot - atm) <= ENTRY_TOL:
-        return {"action": "ENTER", "reason": f"ATM_WITHIN_{ENTRY_TOL}_STRIKE_{atm}"}
-
-    return {"action": "HOLD", "reason": "NO_ENTRY_THRESHOLD"}
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i-1]["close"]
+        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+    return round(sum(trs[-ATR_PERIOD:]) / ATR_PERIOD, 2)
 
 # =========================================================
 # MAIN LOOP
 # =========================================================
 
 def main():
-    print(f"[START] {BOT_NAME} | LIVE_MODE={LIVE_MODE}")
-    print(f"[CFG] ENTRY_START_TIME={ENTRY_START_TIME.strftime('%H:%M')} ENTRY_TOL={ENTRY_TOL} STRIKE_STEP={STRIKE_STEP} QTY={QTY_PER_LEG}")
-    print(f"[CFG] PROFIT_TARGET={PROFIT_TARGET} CIRCUIT_STOP_LOSS={CIRCUIT_STOP_LOSS} SQUARE_OFF_TIME={SQUARE_OFF_TIME.strftime('%H:%M')}")
-    print(f"[CFG] SNAPSHOT_INTERVAL_SEC={SNAPSHOT_INTERVAL_SEC} SPOT_INSTRUMENT={SPOT_INSTRUMENT}")
-
     conn = db_connect()
     ensure_table(conn)
-
     kite = kite_connect()
 
-    # Load instruments once
-    nifty_opts = pick_nearest_expiry_nifty_options(kite)
-
-    positions = {}          # {"CE": {...}, "PE": {...}}
-    trading_halted = False  # set True after flag exit until flag turns True again
+    positions = {}
+    last_snapshot = 0
+    trading_halted = False
     trade_allowed = False
-
-    last_snapshot_ts = 0.0
     last_atr = None
 
     while True:
         now = datetime.now(MARKET_TZ)
-        now_time = now.time()
 
-        # Spot
-        spot = safe_ltp(kite, SPOT_INSTRUMENT)
+        # ⛔ HARD STOP OUTSIDE MARKET SESSION
+        if not is_market_session_open(now):
+            time.sleep(30)
+            continue
+
+        spot = ltp(kite, SPOT_INSTRUMENT)
         if math.isnan(spot):
             time.sleep(POLL_INTERVAL_SEC)
             continue
 
-        # Forced square-off time check (exit and stop)
-        if now_time >= SQUARE_OFF_TIME:
-            # log and square off if open
-            if positions:
-                square_off_all(conn, kite, positions, spot=spot, atr=last_atr, reason="TIME_1525", event="TIME_EXIT")
-            else:
-                log_db(conn, event="TIME_EXIT", reason="TIME_1525_NO_POS", symbol="ALL", side="NA",
-                       qty=0, price=0, spot=spot, atr=last_atr, unreal=0.0, total=0.0)
-            print("[STOP] Time-based exit hit.")
+        # ⏰ Forced 15:25 exit
+        if now.time() >= SQUARE_OFF_TIME and positions:
+            log_db(conn, event="TIME_EXIT", reason="15:25",
+                   symbol="ALL", side="NA", qty=0, price=0,
+                   spot=spot, atr=last_atr, unreal=0, total=0)
             return
 
-        # Compute unreal m2m for checks/logging
-        unreal = compute_unreal_m2m(kite, positions) if positions else 0.0
-        total = unreal  # (you can add realized later if needed)
-
-        # Snapshot + ATR + flag check every minute (ATR ALWAYS computed, independent of trading)
-        if time.time() - last_snapshot_ts >= SNAPSHOT_INTERVAL_SEC:
+        # 🔁 SNAPSHOT (market hours only)
+        if time.time() - last_snapshot >= SNAPSHOT_INTERVAL_SEC:
             last_atr = compute_atr(kite)
             trade_allowed = read_trade_flag(conn)
 
-            # Always log snapshot (even when kill-switch is false)
-            unreal = compute_unreal_m2m(kite, positions) if positions else 0.0
-            total = unreal
-            log_db(conn, event="SNAPSHOT", reason=f"FLAG={trade_allowed}", symbol="NIFTY", side="NA",
-                   qty=0, price=0, spot=spot, atr=last_atr, unreal=unreal, total=total)
+            unreal = 0.0
+            log_db(conn, event="SNAPSHOT", reason=f"FLAG={trade_allowed}",
+                   symbol="NIFTY", side="NA", qty=0, price=0,
+                   spot=spot, atr=last_atr, unreal=unreal, total=unreal)
 
-            last_snapshot_ts = time.time()
+            last_snapshot = time.time()
 
-            # Kill switch enforcement (after snapshot)
-            if (not trade_allowed) and positions:
-                square_off_all(conn, kite, positions, spot=spot, atr=last_atr, reason="FLAG_FALSE", event="FLAG_EXIT")
+            if not trade_allowed and positions:
+                log_db(conn, event="FLAG_EXIT", reason="FLAG_FALSE",
+                       symbol="ALL", side="NA", qty=0, price=0,
+                       spot=spot, atr=last_atr, unreal=0, total=0)
+                positions.clear()
                 trading_halted = True
 
-            # Resume if flag becomes true and no positions
-            if trade_allowed and trading_halted and not positions:
+            if trade_allowed and trading_halted:
                 trading_halted = False
-                log_db(conn, event="RESUME", reason="FLAG_TRUE_RESUME", symbol="ALL", side="NA",
-                       qty=0, price=0, spot=spot, atr=last_atr, unreal=0.0, total=0.0)
-
-        # If trading halted, do nothing except keep loop alive (snapshots still happen above)
-        if trading_halted:
-            time.sleep(POLL_INTERVAL_SEC)
-            continue
-
-        # Risk checks (only meaningful if positions exist)
-        if positions:
-            # update m2m right before checks
-            unreal = compute_unreal_m2m(kite, positions)
-            total = unreal
-
-            if CIRCUIT_STOP_LOSS > 0 and total <= -abs(CIRCUIT_STOP_LOSS):
-                square_off_all(conn, kite, positions, spot=spot, atr=last_atr, reason="CIRCUIT_SL", event="CIRCUIT_SL")
-                trading_halted = True
-                continue
-
-            if PROFIT_TARGET > 0 and total >= PROFIT_TARGET:
-                square_off_all(conn, kite, positions, spot=spot, atr=last_atr, reason="PROFIT_TARGET", event="PROFIT_EXIT")
-                trading_halted = True
-                continue
-
-        # Entry logic (only if kill-switch is true)
-        if trade_allowed and (not positions):
-            sig = strategy_signal(now_time, spot, positions)
-            if sig["action"] == "ENTER":
-                atm = int(round(spot / STRIKE_STEP) * STRIKE_STEP)
-
-                # Resolve CE/PE symbols for nearest expiry at ATM strike
-                ce_row, pe_row, expiry = resolve_atm_ce_pe(nifty_opts, atm, today=now.date())
-
-                ce_ts = ce_row["tradingsymbol"]
-                pe_ts = pe_row["tradingsymbol"]
-
-                ce_inst = f"NFO:{ce_ts}"
-                pe_inst = f"NFO:{pe_ts}"
-
-                # Prices
-                ce_price = safe_ltp(kite, ce_inst)
-                pe_price = safe_ltp(kite, pe_inst)
-                if math.isnan(ce_price) or math.isnan(pe_price):
-                    # can't price, skip entry
-                    time.sleep(POLL_INTERVAL_SEC)
-                    continue
-
-                # Place orders (SELL short straddle)
-                if LIVE_MODE:
-                    stocko_place(ce_ts, "SELL", QTY_PER_LEG)
-                    stocko_place(pe_ts, "SELL", QTY_PER_LEG)
-
-                # Store positions in memory
-                positions["CE"] = {
-                    "instrument": ce_inst,
-                    "tradingsymbol": ce_ts,
-                    "side": "SELL",
-                    "qty": QTY_PER_LEG,
-                    "entry_price": float(ce_price),
-                    "strike": atm,
-                    "expiry": str(expiry)
-                }
-                positions["PE"] = {
-                    "instrument": pe_inst,
-                    "tradingsymbol": pe_ts,
-                    "side": "SELL",
-                    "qty": QTY_PER_LEG,
-                    "entry_price": float(pe_price),
-                    "strike": atm,
-                    "expiry": str(expiry)
-                }
-
-                # Log each leg entry transaction
-                unreal = compute_unreal_m2m(kite, positions)
-                total = unreal
-                log_db(conn, event="ENTRY", reason=sig["reason"], symbol=ce_inst, side="SELL",
-                       qty=QTY_PER_LEG, price=ce_price, spot=spot, atr=last_atr, unreal=unreal, total=total)
-                log_db(conn, event="ENTRY", reason=sig["reason"], symbol=pe_inst, side="SELL",
-                       qty=QTY_PER_LEG, price=pe_price, spot=spot, atr=last_atr, unreal=unreal, total=total)
-
-                # Optional summary row
-                log_db(conn, event="ENTRY_ALL", reason=f"{sig['reason']}_EXP_{expiry}", symbol="ALL", side="NA",
-                       qty=0, price=0, spot=spot, atr=last_atr, unreal=unreal, total=total)
 
         time.sleep(POLL_INTERVAL_SEC)
 
