@@ -391,62 +391,71 @@ def resolve_atm_ce_pe(nfo_df: pd.DataFrame, atm: int, today: date) -> tuple[str,
         raise RuntimeError(f"Could not resolve CE/PE for strike={atm} expiry={expiry}")
 
     return str(ce.iloc[0]["tradingsymbol"]), str(pe.iloc[0]["tradingsymbol"]), str(expiry)
-
 # =========================================================
-# ATR BUILDER (FUT minute candle builder)
+# ATR BUILDER (FUT minute candle builder) – FIXED
 # =========================================================
 
 class FutAtrBuilder:
     def __init__(self, atr_period: int):
         self.atr_period = atr_period
         self.tr_history = []
-        self.last_minute = None
+
+        # minute candle state
+        self.last_minute_key = None
         self.minute_high = None
         self.minute_low = None
         self.minute_close = None
+
         self.prev_close = None
         self.atr_val = None
 
     def update(self, now: datetime, fut_ltp: float) -> float | None:
-        if math.isnan(fut_ltp):
+        if fut_ltp is None or math.isnan(fut_ltp):
             return self.atr_val
 
-        cur_minute = now.minute
+        # full minute key (safe across hour change)
+        minute_key = now.replace(second=0, microsecond=0)
 
-        if self.last_minute is None:
-            self.last_minute = cur_minute
+        # first tick ever
+        if self.last_minute_key is None:
+            self.last_minute_key = minute_key
             self.minute_high = fut_ltp
             self.minute_low = fut_ltp
             self.minute_close = fut_ltp
+            self.prev_close = fut_ltp
             return self.atr_val
 
-        if cur_minute == self.last_minute:
+        # same minute → build candle
+        if minute_key == self.last_minute_key:
             self.minute_high = max(self.minute_high, fut_ltp)
             self.minute_low = min(self.minute_low, fut_ltp)
             self.minute_close = fut_ltp
             return self.atr_val
 
-        # minute changed -> finalize TR
-        if self.prev_close is not None:
-            tr = max(
-                self.minute_high - self.minute_low,
-                abs(self.minute_high - self.prev_close),
-                abs(self.minute_low - self.prev_close),
+        # minute changed → finalize previous candle
+        tr = max(
+            self.minute_high - self.minute_low,
+            abs(self.minute_high - self.prev_close),
+            abs(self.minute_low - self.prev_close),
+        )
+        self.tr_history.append(tr)
+
+        if len(self.tr_history) >= self.atr_period:
+            self.atr_val = round(
+                sum(self.tr_history[-self.atr_period:]) / self.atr_period, 2
             )
-            self.tr_history.append(tr)
-            if len(self.tr_history) >= self.atr_period:
-                self.atr_val = round(sum(self.tr_history[-self.atr_period:]) / self.atr_period, 2)
-            else:
-                self.atr_val = None
+        else:
+            self.atr_val = None
 
+        # move to new minute
         self.prev_close = self.minute_close
-
-        # start new minute
-        self.last_minute = cur_minute
+        self.last_minute_key = minute_key
         self.minute_high = fut_ltp
         self.minute_low = fut_ltp
         self.minute_close = fut_ltp
+
         return self.atr_val
+
 
 # =========================================================
 # PNL / POSITIONS
