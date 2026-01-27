@@ -8,6 +8,7 @@ SS NIFTY FUT – ATM SHORT STRADDLE (Railway Deployable) – FUT ONLY
 ✅ FUT-based ATR (built live from NIFTY FUT minute candle builder)
 ✅ Options chosen from next immediate expiry (nearest expiry >= today)
 ✅ Kill-switch every minute from trade_flag.<FLAG_COL>
+✅ Auto-creates trade_flag table + FLAG_COL + ensures exactly ONE row (id=1)
 ✅ M2M snapshots every minute to DB with CE/PE entry/ltp/exit prices
 ✅ Entry/Exit transactions stored in DB too
 ✅ Forced square-off at 15:25
@@ -145,7 +146,7 @@ def db_connect():
     return psycopg2.connect(url, sslmode="require", cursor_factory=RealDictCursor)
 
 def ensure_table(conn):
-    """Create table and ensure new columns exist (idempotent)."""
+    """Create strategy table and ensure new columns exist (idempotent)."""
     with conn.cursor() as c:
         c.execute(sql.SQL("""
             CREATE TABLE IF NOT EXISTS {t} (
@@ -183,10 +184,68 @@ def ensure_table(conn):
             ("ce_exit_price", "NUMERIC"),
             ("pe_exit_price", "NUMERIC"),
         ]:
-            c.execute(sql.SQL("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS {c} " + coltype).format(
-                t=sql.Identifier(TABLE_NAME),
-                c=sql.Identifier(col)
+            c.execute(
+                sql.SQL("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS {c} " + coltype).format(
+                    t=sql.Identifier(TABLE_NAME),
+                    c=sql.Identifier(col)
+                )
+            )
+    conn.commit()
+
+def ensure_trade_flag(conn):
+    """
+    Ensures:
+    - FLAG_TABLE exists
+    - FLAG_COL exists
+    - exactly one row exists (id=1)
+    - default value = TRUE
+    """
+    with conn.cursor() as c:
+        # Table exists
+        c.execute(sql.SQL("""
+            CREATE TABLE IF NOT EXISTS {tbl} (
+                id INT PRIMARY KEY
+            )
+        """).format(tbl=sql.Identifier(FLAG_TABLE)))
+
+        # Column exists
+        c.execute(sql.SQL("""
+            ALTER TABLE {tbl}
+            ADD COLUMN IF NOT EXISTS {col} BOOLEAN DEFAULT TRUE
+        """).format(
+            tbl=sql.Identifier(FLAG_TABLE),
+            col=sql.Identifier(FLAG_COL)
+        ))
+
+        # Ensure one row
+        c.execute(sql.SQL("SELECT COUNT(*) AS cnt FROM {tbl}").format(
+            tbl=sql.Identifier(FLAG_TABLE)
+        ))
+        cnt = int(c.fetchone()["cnt"])
+
+        if cnt == 0:
+            c.execute(sql.SQL("""
+                INSERT INTO {tbl} (id, {col})
+                VALUES (1, TRUE)
+            """).format(
+                tbl=sql.Identifier(FLAG_TABLE),
+                col=sql.Identifier(FLAG_COL)
             ))
+        elif cnt > 1:
+            c.execute(sql.SQL("""
+                DELETE FROM {tbl} WHERE id <> 1
+            """).format(tbl=sql.Identifier(FLAG_TABLE)))
+
+        # If id=1 exists but NULL, set TRUE
+        c.execute(sql.SQL("""
+            UPDATE {tbl}
+            SET {col} = COALESCE({col}, TRUE)
+            WHERE id = 1
+        """).format(
+            tbl=sql.Identifier(FLAG_TABLE),
+            col=sql.Identifier(FLAG_COL)
+        ))
+
     conn.commit()
 
 def log_db(
@@ -245,13 +304,22 @@ def log_db(
     conn.commit()
 
 def read_trade_flag(conn) -> bool:
-    with conn.cursor() as c:
-        c.execute(sql.SQL("SELECT {col} FROM {tbl} LIMIT 1").format(
-            col=sql.Identifier(FLAG_COL),
-            tbl=sql.Identifier(FLAG_TABLE),
-        ))
-        r = c.fetchone()
-        return bool(r[FLAG_COL]) if r and (FLAG_COL in r) else False
+    """
+    Returns flag value.
+    If anything unexpected happens, returns False (safe).
+    """
+    try:
+        with conn.cursor() as c:
+            c.execute(sql.SQL("SELECT {col} FROM {tbl} WHERE id=1 LIMIT 1").format(
+                col=sql.Identifier(FLAG_COL),
+                tbl=sql.Identifier(FLAG_TABLE),
+            ))
+            r = c.fetchone()
+            if not r:
+                return False
+            return bool(r.get(FLAG_COL))
+    except Exception:
+        return False
 
 # =========================================================
 # KITE / MARKET
@@ -370,7 +438,7 @@ def get_nearest_nifty_fut_symbol(nfo_df: pd.DataFrame) -> str:
     if fut.empty:
         raise RuntimeError("No NIFTY FUT found in instruments.")
     fut["expiry"] = pd.to_datetime(fut["expiry"])
-    fut = fut.sort_values("expiry").iloc[0]   # nearest expiry = current month / nearest contract
+    fut = fut.sort_values("expiry").iloc[0]   # nearest expiry contract
     return str(fut["tradingsymbol"])
 
 def resolve_atm_ce_pe(nfo_df: pd.DataFrame, atm: int, today: date) -> tuple[str, str, str]:
@@ -567,6 +635,7 @@ def should_enter(now: datetime, underlying_fut: float, positions: dict) -> tuple
 def main():
     conn = db_connect()
     ensure_table(conn)
+    ensure_trade_flag(conn)  # ✅ creates trade_flag + live_ss_nifty_fut column + row id=1
     kite = kite_connect()
 
     nfo_df = load_instruments_once(kite)
@@ -589,6 +658,7 @@ def main():
     print(f"[CFG] ENTRY_START_TIME={ENTRY_START_TIME.strftime('%H:%M')} ENTRY_TOL={ENTRY_TOL} STRIKE_STEP={STRIKE_STEP} QTY={QTY_PER_LEG}")
     print(f"[CFG] PROFIT_TARGET={PROFIT_TARGET} CIRCUIT_STOP_LOSS={CIRCUIT_STOP_LOSS} SQUARE_OFF_TIME={SQUARE_OFF_TIME.strftime('%H:%M')}")
     print(f"[CFG] FUT_UNDERLYING={fut_inst} ATR_PERIOD={ATR_PERIOD}")
+    print(f"[CFG] FLAG_TABLE={FLAG_TABLE} FLAG_COL={FLAG_COL}")
     if FUT_TRADINGSYMBOL_OVERRIDE:
         print(f"[CFG] FUT_TRADINGSYMBOL override enabled: {FUT_TRADINGSYMBOL_OVERRIDE}")
     if not NSE_HOLIDAYS:
@@ -610,7 +680,7 @@ def main():
                 print("[INFO] Market OPEN. Bot active.")
                 last_market_status = None
 
-        # ---- Fetch FUT LTP only (single ltp call) ----
+        # ---- Fetch FUT LTP only ----
         ltps = safe_ltp_many(kite, [fut_inst])
         fut_ltp = ltps.get(fut_inst, float("nan"))
         if math.isnan(fut_ltp):
@@ -619,7 +689,7 @@ def main():
 
         underlying = float(fut_ltp)
 
-        # ---- Update ATR builder every tick (FUT-based) ----
+        # ---- Update ATR every tick (FUT-based) ----
         last_atr = atr_builder.update(now, underlying)
 
         # ---- Forced square-off at 15:25 ----
