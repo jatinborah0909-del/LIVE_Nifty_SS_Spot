@@ -7,24 +7,23 @@ SS NIFTY FUT – ATM SHORT STRADDLE (Railway Deployable) – FUT ONLY
 ✅ FUT-based underlying for EVERYTHING (ATM, entry logic, logging reference price)
 ✅ FUT-based ATR (built live from NIFTY FUT minute candle builder)
 ✅ Options chosen from next immediate expiry (nearest expiry >= today)
-✅ Kill-switch every minute from trade_flag.<FLAG_COL>
-✅ Auto-creates trade_flag table + FLAG_COL + ensures exactly ONE row (id=1)
+✅ Kill-switch every minute from trade_flag.<FLAG_COL> (READ ONLY)
 ✅ M2M snapshots every minute to DB with CE/PE entry/ltp/exit prices
 ✅ Entry/Exit transactions stored in DB too
 ✅ Forced square-off at 15:25
 ✅ NO API calls + NO DB writes outside market session (before 09:15 / after 15:30), weekends, holidays
 ✅ PAPER mode won’t fail without Stocko credentials
 
-🆕 FIX ADDED:
-✅ Stores BOTH CE and PE strikes in DB columns:
-   - ce_strike (INT)
-   - pe_strike (INT)
+🆕 ADDITION:
+✅ Production-safe ATM rolling:
+   - When FUT reaches next ±50 strike within ENTRY_TOL, exits old ATM and re-enters new ATM
+✅ Roll details logged into DB (ROLL event row) with from/to strike + old/new symbols + expiry
 
 DB table (default): live_ss_nifty_fut
 Kill switch table: trade_flag, column: live_ss_nifty_fut
 
 IMPORTANT:
-- DB column "spot" is retained for compatibility but now stores FUT underlying price.
+- DB column "spot" is retained for compatibility but now stores FUT underlying price here.
 - CIRCUIT_STOP_LOSS uses magnitude. For -4000 loss circuit, set CIRCUIT_STOP_LOSS=4000
 """
 
@@ -69,10 +68,6 @@ def parse_hhmm(key, default):
         raise ValueError(f"{key} must be HH:MM (e.g. {default}). Got: {s!r}")
 
 def parse_dates_csv(key, default=""):
-    """
-    NSE_HOLIDAYS env example:
-      NSE_HOLIDAYS=2026-01-26,2026-03-06,2026-04-10
-    """
     s = os.getenv(key, default).strip()
     out = set()
     if not s:
@@ -89,7 +84,6 @@ def parse_dates_csv(key, default=""):
     return out
 
 def safe_ident(name: str, fallback: str) -> str:
-    """Allow only a-zA-Z0-9_ for table/column env vars."""
     name = (name or "").strip()
     if not name:
         return fallback
@@ -122,8 +116,10 @@ SNAPSHOT_INTERVAL_SEC = env_int("SNAPSHOT_INTERVAL_SEC", 60)
 ATR_PERIOD = env_int("ATR_PERIOD", 14)
 NSE_HOLIDAYS = parse_dates_csv("NSE_HOLIDAYS", default="")
 
-# Optional override: if you want to hardcode a FUT tradingsymbol (rarely needed)
-FUT_TRADINGSYMBOL_OVERRIDE = os.getenv("FUT_TRADINGSYMBOL", "").strip()  # e.g., "NIFTY26JANFUT"
+# Rolling control (optional; defaults to ON)
+ENABLE_ATM_ROLLING = env_bool("ENABLE_ATM_ROLLING", True)
+
+FUT_TRADINGSYMBOL_OVERRIDE = os.getenv("FUT_TRADINGSYMBOL", "").strip()
 
 TABLE_NAME = safe_ident(os.getenv("TABLE_NAME", "live_ss_nifty_fut"), "live_ss_nifty_fut")
 FLAG_TABLE = safe_ident(os.getenv("FLAG_TABLE", "trade_flag"), "trade_flag")
@@ -166,9 +162,7 @@ def ensure_table(conn):
                 qty INT,
                 price NUMERIC,
 
-                -- For backward compatibility, we keep "spot" but store FUT underlying price here
-                spot NUMERIC,
-
+                spot NUMERIC,          -- stores FUT underlying price
                 atr NUMERIC,
                 unreal_pnl NUMERIC,
                 total_pnl NUMERIC,
@@ -180,13 +174,27 @@ def ensure_table(conn):
                 ce_exit_price NUMERIC,
                 pe_exit_price NUMERIC,
 
-                -- 🆕 strikes stored explicitly
                 ce_strike INT,
-                pe_strike INT
+                pe_strike INT,
+
+                -- 🆕 symbols/expiry (useful for debugging and roll logs)
+                ce_symbol TEXT,
+                pe_symbol TEXT,
+                opt_expiry TEXT,
+
+                -- 🆕 roll logging
+                roll_from_strike INT,
+                roll_to_strike INT,
+                roll_from_ce_symbol TEXT,
+                roll_from_pe_symbol TEXT,
+                roll_to_ce_symbol TEXT,
+                roll_to_pe_symbol TEXT,
+                roll_from_expiry TEXT,
+                roll_to_expiry TEXT
             );
         """).format(t=sql.Identifier(TABLE_NAME)))
 
-        for col, coltype in [
+        add_cols = [
             ("ce_entry_price", "NUMERIC"),
             ("pe_entry_price", "NUMERIC"),
             ("ce_ltp", "NUMERIC"),
@@ -195,69 +203,28 @@ def ensure_table(conn):
             ("pe_exit_price", "NUMERIC"),
             ("ce_strike", "INT"),
             ("pe_strike", "INT"),
-        ]:
+
+            ("ce_symbol", "TEXT"),
+            ("pe_symbol", "TEXT"),
+            ("opt_expiry", "TEXT"),
+
+            ("roll_from_strike", "INT"),
+            ("roll_to_strike", "INT"),
+            ("roll_from_ce_symbol", "TEXT"),
+            ("roll_from_pe_symbol", "TEXT"),
+            ("roll_to_ce_symbol", "TEXT"),
+            ("roll_to_pe_symbol", "TEXT"),
+            ("roll_from_expiry", "TEXT"),
+            ("roll_to_expiry", "TEXT"),
+        ]
+
+        for col, coltype in add_cols:
             c.execute(
                 sql.SQL("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS {c} " + coltype).format(
                     t=sql.Identifier(TABLE_NAME),
                     c=sql.Identifier(col)
                 )
             )
-    conn.commit()
-
-def ensure_trade_flag(conn):
-    """
-    Ensures:
-    - FLAG_TABLE exists
-    - FLAG_COL exists
-    - exactly one row exists (id=1)
-    - default value = TRUE
-    """
-    with conn.cursor() as c:
-        # Table exists
-        c.execute(sql.SQL("""
-            CREATE TABLE IF NOT EXISTS {tbl} (
-                id INT PRIMARY KEY
-            )
-        """).format(tbl=sql.Identifier(FLAG_TABLE)))
-
-        # Column exists
-        c.execute(sql.SQL("""
-            ALTER TABLE {tbl}
-            ADD COLUMN IF NOT EXISTS {col} BOOLEAN DEFAULT TRUE
-        """).format(
-            tbl=sql.Identifier(FLAG_TABLE),
-            col=sql.Identifier(FLAG_COL)
-        ))
-
-        # Ensure one row
-        c.execute(sql.SQL("SELECT COUNT(*) AS cnt FROM {tbl}").format(
-            tbl=sql.Identifier(FLAG_TABLE)
-        ))
-        cnt = int(c.fetchone()["cnt"])
-
-        if cnt == 0:
-            c.execute(sql.SQL("""
-                INSERT INTO {tbl} (id, {col})
-                VALUES (1, TRUE)
-            """).format(
-                tbl=sql.Identifier(FLAG_TABLE),
-                col=sql.Identifier(FLAG_COL)
-            ))
-        elif cnt > 1:
-            c.execute(sql.SQL("""
-                DELETE FROM {tbl} WHERE id <> 1
-            """).format(tbl=sql.Identifier(FLAG_TABLE)))
-
-        # If id=1 exists but NULL, set TRUE
-        c.execute(sql.SQL("""
-            UPDATE {tbl}
-            SET {col} = COALESCE({col}, TRUE)
-            WHERE id = 1
-        """).format(
-            tbl=sql.Identifier(FLAG_TABLE),
-            col=sql.Identifier(FLAG_COL)
-        ))
-
     conn.commit()
 
 def log_db(
@@ -281,6 +248,17 @@ def log_db(
     pe_exit=None,
     ce_strike=None,
     pe_strike=None,
+    ce_symbol=None,
+    pe_symbol=None,
+    opt_expiry=None,
+    roll_from_strike=None,
+    roll_to_strike=None,
+    roll_from_ce_symbol=None,
+    roll_from_pe_symbol=None,
+    roll_to_ce_symbol=None,
+    roll_to_pe_symbol=None,
+    roll_from_expiry=None,
+    roll_to_expiry=None,
 ):
     with conn.cursor() as c:
         c.execute(sql.SQL("""
@@ -292,10 +270,15 @@ def log_db(
               ce_entry_price, pe_entry_price,
               ce_ltp, pe_ltp,
               ce_exit_price, pe_exit_price,
-              ce_strike, pe_strike
+              ce_strike, pe_strike,
+              ce_symbol, pe_symbol, opt_expiry,
+              roll_from_strike, roll_to_strike,
+              roll_from_ce_symbol, roll_from_pe_symbol,
+              roll_to_ce_symbol, roll_to_pe_symbol,
+              roll_from_expiry, roll_to_expiry
             )
             VALUES
-            (NOW(), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            (NOW(), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """).format(t=sql.Identifier(TABLE_NAME)), (
             BOT_NAME,
             "LIVE" if LIVE_MODE else "PAPER",
@@ -317,13 +300,28 @@ def log_db(
             float(pe_exit) if pe_exit is not None else None,
             int(ce_strike) if ce_strike is not None else None,
             int(pe_strike) if pe_strike is not None else None,
+            str(ce_symbol) if ce_symbol is not None else None,
+            str(pe_symbol) if pe_symbol is not None else None,
+            str(opt_expiry) if opt_expiry is not None else None,
+            int(roll_from_strike) if roll_from_strike is not None else None,
+            int(roll_to_strike) if roll_to_strike is not None else None,
+            str(roll_from_ce_symbol) if roll_from_ce_symbol is not None else None,
+            str(roll_from_pe_symbol) if roll_from_pe_symbol is not None else None,
+            str(roll_to_ce_symbol) if roll_to_ce_symbol is not None else None,
+            str(roll_to_pe_symbol) if roll_to_pe_symbol is not None else None,
+            str(roll_from_expiry) if roll_from_expiry is not None else None,
+            str(roll_to_expiry) if roll_to_expiry is not None else None,
         ))
     conn.commit()
 
+# =========================================================
+# 🔒 READ-ONLY TRADE FLAG
+# =========================================================
+
 def read_trade_flag(conn) -> bool:
     """
-    Returns flag value.
-    If anything unexpected happens, returns False (safe).
+    READ-ONLY kill switch.
+    Safe default = False.
     """
     try:
         with conn.cursor() as c:
@@ -333,9 +331,15 @@ def read_trade_flag(conn) -> bool:
             ))
             r = c.fetchone()
             if not r:
+                print(f"[FLAG] Missing row id=1 in {FLAG_TABLE}. Trading disabled.")
                 return False
-            return bool(r.get(FLAG_COL))
-    except Exception:
+            val = r.get(FLAG_COL, None)
+            if val is None:
+                print(f"[FLAG] {FLAG_TABLE}.{FLAG_COL} is NULL. Trading disabled.")
+                return False
+            return bool(val)
+    except Exception as e:
+        print(f"[FLAG] Read error ({FLAG_TABLE}.{FLAG_COL}) -> Trading disabled. Err: {e}")
         return False
 
 # =========================================================
@@ -455,13 +459,10 @@ def get_nearest_nifty_fut_symbol(nfo_df: pd.DataFrame) -> str:
     if fut.empty:
         raise RuntimeError("No NIFTY FUT found in instruments.")
     fut["expiry"] = pd.to_datetime(fut["expiry"])
-    fut = fut.sort_values("expiry").iloc[0]   # nearest expiry contract
+    fut = fut.sort_values("expiry").iloc[0]
     return str(fut["tradingsymbol"])
 
 def resolve_atm_ce_pe(nfo_df: pd.DataFrame, atm: int, today: date) -> tuple[str, str, str]:
-    """
-    Picks NEXT IMMEDIATE option expiry: nearest expiry date >= today.
-    """
     opt = nfo_df[nfo_df["instrument_type"].isin(["CE", "PE"])].copy()
     if opt.empty:
         raise RuntimeError("No NIFTY options found in instruments.")
@@ -470,7 +471,7 @@ def resolve_atm_ce_pe(nfo_df: pd.DataFrame, atm: int, today: date) -> tuple[str,
     expiries = sorted({e for e in opt["expiry"].unique() if e >= today})
     if not expiries:
         raise RuntimeError("No upcoming option expiries found.")
-    expiry = expiries[0]  # next immediate expiry
+    expiry = expiries[0]
 
     ce = opt[(opt["expiry"] == expiry) & (opt["instrument_type"] == "CE") & (opt["strike"].astype(int) == int(atm))]
     pe = opt[(opt["expiry"] == expiry) & (opt["instrument_type"] == "PE") & (opt["strike"].astype(int) == int(atm))]
@@ -481,19 +482,17 @@ def resolve_atm_ce_pe(nfo_df: pd.DataFrame, atm: int, today: date) -> tuple[str,
     return str(ce.iloc[0]["tradingsymbol"]), str(pe.iloc[0]["tradingsymbol"]), str(expiry)
 
 # =========================================================
-# ATR BUILDER (FUT minute candle builder)
+# ATR BUILDER
 # =========================================================
 
 class FutAtrBuilder:
     def __init__(self, atr_period: int):
         self.atr_period = atr_period
         self.tr_history = []
-
         self.last_minute_key = None
         self.minute_high = None
         self.minute_low = None
         self.minute_close = None
-
         self.prev_close = None
         self.atr_val = None
 
@@ -564,7 +563,6 @@ def compute_unreal_m2m(kite: KiteConnect, positions: dict, ce_inst: str, pe_inst
 
 def square_off(conn, kite: KiteConnect, positions: dict, ce_ts: str, pe_ts: str,
                underlying_fut: float, atr: float | None, reason: str, event: str):
-    """Exit both legs and log exit prices + include entry prices + strikes."""
     if not positions:
         return
 
@@ -576,6 +574,7 @@ def square_off(conn, kite: KiteConnect, positions: dict, ce_ts: str, pe_ts: str,
     pe_entry = positions.get("PE", {}).get("entry")
     ce_strk  = positions.get("CE", {}).get("strike")
     pe_strk  = positions.get("PE", {}).get("strike")
+    expiry   = positions.get("CE", {}).get("expiry") or positions.get("PE", {}).get("expiry")
 
     for leg, tsym, inst, offset in [("CE", ce_ts, ce_inst, 0), ("PE", pe_ts, pe_inst, 1)]:
         if leg not in positions:
@@ -611,6 +610,9 @@ def square_off(conn, kite: KiteConnect, positions: dict, ce_ts: str, pe_ts: str,
             pe_exit=exit_price if leg == "PE" else None,
             ce_strike=ce_strk,
             pe_strike=pe_strk,
+            ce_symbol=ce_ts,
+            pe_symbol=pe_ts,
+            opt_expiry=expiry,
         )
 
     log_db(
@@ -631,6 +633,9 @@ def square_off(conn, kite: KiteConnect, positions: dict, ce_ts: str, pe_ts: str,
         pe_exit=ltps.get(pe_inst) if not math.isnan(ltps.get(pe_inst, float("nan"))) else None,
         ce_strike=ce_strk,
         pe_strike=pe_strk,
+        ce_symbol=ce_ts,
+        pe_symbol=pe_ts,
+        opt_expiry=expiry,
     )
 
     positions.clear()
@@ -652,15 +657,150 @@ def should_enter(now: datetime, underlying_fut: float, positions: dict) -> tuple
     return False, f"NO_ENTRY_DIFF_{diff:.2f}_GT_{ENTRY_TOL}", atm, diff
 
 # =========================================================
+# ATM ROLLING (PRODUCTION SAFE)
+# =========================================================
+
+def maybe_roll_and_reenter(
+    conn, kite, nfo_df, positions,
+    ce_ts, pe_ts,
+    underlying, last_atr,
+    trade_allowed_now,
+    now
+):
+    """
+    Rolls only when:
+    - ENABLE_ATM_ROLLING True
+    - positions open
+    - time >= ENTRY_START_TIME
+    - trade_allowed_now True
+    - underlying is within ENTRY_TOL of a NEW ATM strike (different from active strike)
+    Then:
+    - square off old
+    - log ROLL event with from/to strikes + old/new symbols+expiry
+    - re-enter new ATM immediately
+    Returns: (rolled: bool, new_ce_ts, new_pe_ts)
+    """
+    if not ENABLE_ATM_ROLLING:
+        return False, ce_ts, pe_ts
+    if not positions or not ce_ts or not pe_ts:
+        return False, ce_ts, pe_ts
+    if now.time() < ENTRY_START_TIME:
+        return False, ce_ts, pe_ts
+    if not trade_allowed_now:
+        return False, ce_ts, pe_ts
+
+    active_strike = positions.get("CE", {}).get("strike")
+    if active_strike is None:
+        return False, ce_ts, pe_ts
+
+    current_atm = int(round(underlying / STRIKE_STEP) * STRIKE_STEP)
+    if current_atm == int(active_strike):
+        return False, ce_ts, pe_ts
+
+    diff = abs(underlying - current_atm)
+    if diff > ENTRY_TOL:
+        return False, ce_ts, pe_ts
+
+    # Resolve new symbols BEFORE exiting (so we can log target roll info)
+    try:
+        new_ce_ts, new_pe_ts, new_expiry = resolve_atm_ce_pe(nfo_df, current_atm, now.date())
+    except Exception as e:
+        print(f"[ROLL] Could not resolve new ATM instruments for {current_atm}: {e}")
+        return False, ce_ts, pe_ts
+
+    old_expiry = positions.get("CE", {}).get("expiry") or positions.get("PE", {}).get("expiry")
+
+    reason = f"ATM_ROLL_FROM_{active_strike}_TO_{current_atm}_DIFF_{diff:.2f}"
+
+    # Exit old position
+    square_off(conn, kite, positions, ce_ts, pe_ts, underlying, last_atr, reason, "ROLL_EXIT")
+
+    # Log roll meta row (separate from EXIT logs)
+    log_db(
+        conn,
+        event="ROLL",
+        reason=reason,
+        symbol="ALL",
+        side="NA",
+        qty=0,
+        price=0,
+        underlying_fut=underlying,
+        atr=last_atr,
+        unreal=0.0,
+        total=0.0,
+        roll_from_strike=int(active_strike),
+        roll_to_strike=int(current_atm),
+        roll_from_ce_symbol=ce_ts,
+        roll_from_pe_symbol=pe_ts,
+        roll_to_ce_symbol=new_ce_ts,
+        roll_to_pe_symbol=new_pe_ts,
+        roll_from_expiry=str(old_expiry) if old_expiry is not None else None,
+        roll_to_expiry=str(new_expiry),
+    )
+
+    # Re-enter immediately at new ATM
+    new_ce_inst = f"NFO:{new_ce_ts}"
+    new_pe_inst = f"NFO:{new_pe_ts}"
+    leg_ltps = safe_ltp_many(kite, [new_ce_inst, new_pe_inst])
+    ce_price = leg_ltps.get(new_ce_inst, float("nan"))
+    pe_price = leg_ltps.get(new_pe_inst, float("nan"))
+    if math.isnan(ce_price) or math.isnan(pe_price):
+        print("[ROLL] New leg prices NaN, skipping re-entry this tick.")
+        return True, new_ce_ts, new_pe_ts
+
+    if LIVE_MODE:
+        stocko_place_by_tradingsymbol(new_ce_ts, "SELL", QTY_PER_LEG, offset=201)
+        stocko_place_by_tradingsymbol(new_pe_ts, "SELL", QTY_PER_LEG, offset=202)
+
+    positions["CE"] = {"side": "SELL", "qty": QTY_PER_LEG, "entry": float(ce_price), "strike": int(current_atm), "expiry": str(new_expiry)}
+    positions["PE"] = {"side": "SELL", "qty": QTY_PER_LEG, "entry": float(pe_price), "strike": int(current_atm), "expiry": str(new_expiry)}
+
+    unreal = compute_unreal_m2m(kite, positions, new_ce_inst, new_pe_inst)
+
+    log_db(
+        conn,
+        event="ENTRY_ALL",
+        reason=f"ROLL_REENTRY_ATM_{current_atm}_EXP={new_expiry}",
+        symbol="ALL",
+        side="NA",
+        qty=0,
+        price=0,
+        underlying_fut=underlying,
+        atr=last_atr,
+        unreal=unreal,
+        total=unreal,
+        ce_entry=float(ce_price),
+        pe_entry=float(pe_price),
+        ce_ltp=float(ce_price),
+        pe_ltp=float(pe_price),
+        ce_strike=int(current_atm),
+        pe_strike=int(current_atm),
+        ce_symbol=new_ce_ts,
+        pe_symbol=new_pe_ts,
+        opt_expiry=str(new_expiry),
+        roll_from_strike=int(active_strike),
+        roll_to_strike=int(current_atm),
+        roll_from_ce_symbol=ce_ts,
+        roll_from_pe_symbol=pe_ts,
+        roll_to_ce_symbol=new_ce_ts,
+        roll_to_pe_symbol=new_pe_ts,
+        roll_from_expiry=str(old_expiry) if old_expiry is not None else None,
+        roll_to_expiry=str(new_expiry),
+    )
+
+    return True, new_ce_ts, new_pe_ts
+
+# =========================================================
 # MAIN
 # =========================================================
 
 def main():
     conn = db_connect()
     ensure_table(conn)
-    ensure_trade_flag(conn)
-    kite = kite_connect()
 
+    # IMPORTANT: trade_flag is READ ONLY. Do NOT create/update/delete it here.
+
+    kite = kite_connect()
     nfo_df = load_instruments_once(kite)
 
     fut_ts = FUT_TRADINGSYMBOL_OVERRIDE or get_nearest_nifty_fut_symbol(nfo_df)
@@ -682,10 +822,7 @@ def main():
     print(f"[CFG] PROFIT_TARGET={PROFIT_TARGET} CIRCUIT_STOP_LOSS={CIRCUIT_STOP_LOSS} SQUARE_OFF_TIME={SQUARE_OFF_TIME.strftime('%H:%M')}")
     print(f"[CFG] FUT_UNDERLYING={fut_inst} ATR_PERIOD={ATR_PERIOD}")
     print(f"[CFG] FLAG_TABLE={FLAG_TABLE} FLAG_COL={FLAG_COL}")
-    if FUT_TRADINGSYMBOL_OVERRIDE:
-        print(f"[CFG] FUT_TRADINGSYMBOL override enabled: {FUT_TRADINGSYMBOL_OVERRIDE}")
-    if not NSE_HOLIDAYS:
-        print("[WARN] NSE_HOLIDAYS not set. Weekends blocked, but holidays won’t be blocked until you set NSE_HOLIDAYS.")
+    print(f"[CFG] ENABLE_ATM_ROLLING={ENABLE_ATM_ROLLING}")
 
     while True:
         now = datetime.now(MARKET_TZ)
@@ -732,8 +869,6 @@ def main():
                     atr=last_atr,
                     unreal=0.0,
                     total=0.0,
-                    ce_strike=None,
-                    pe_strike=None,
                 )
             print("[STOP] 15:25 square-off executed. Exiting process.")
             return
@@ -746,6 +881,7 @@ def main():
             pe_entry = positions.get("PE", {}).get("entry") if positions else None
             ce_strk  = positions.get("CE", {}).get("strike") if positions else None
             pe_strk  = positions.get("PE", {}).get("strike") if positions else None
+            expiry   = positions.get("CE", {}).get("expiry") if positions else None
 
             ce_inst = f"NFO:{ce_ts}" if ce_ts else None
             pe_inst = f"NFO:{pe_ts}" if pe_ts else None
@@ -779,6 +915,9 @@ def main():
                 pe_ltp=pe_ltp,
                 ce_strike=ce_strk,
                 pe_strike=pe_strk,
+                ce_symbol=ce_ts if ce_ts else None,
+                pe_symbol=pe_ts if pe_ts else None,
+                opt_expiry=expiry,
             )
 
             last_snapshot_ts = time.time()
@@ -803,12 +942,28 @@ def main():
                     atr=last_atr,
                     unreal=0.0,
                     total=0.0,
-                    ce_strike=None,
-                    pe_strike=None,
                 )
 
-        # ---- If halted, do not enter ----
+        # ---- If halted, do not enter/roll ----
         if trading_halted:
+            time.sleep(POLL_INTERVAL_SEC)
+            continue
+
+        # Optional: refresh flag before roll/entry
+        trade_allowed_now = trade_allowed_cached
+        if RECHECK_FLAG_ON_ENTRY:
+            trade_allowed_now = read_trade_flag(conn)
+
+        # ---- ✅ ATM ROLLING ----
+        rolled, ce_ts, pe_ts = maybe_roll_and_reenter(
+            conn, kite, nfo_df, positions,
+            ce_ts, pe_ts,
+            underlying, last_atr,
+            trade_allowed_now,
+            now
+        )
+        if rolled:
+            # after roll+reentry, continue loop (no extra entry logic this tick)
             time.sleep(POLL_INTERVAL_SEC)
             continue
 
@@ -854,9 +1009,8 @@ def main():
                     stocko_place_by_tradingsymbol(ce_ts, "SELL", QTY_PER_LEG, offset=1)
                     stocko_place_by_tradingsymbol(pe_ts, "SELL", QTY_PER_LEG, offset=2)
 
-                # store strike+expiry in memory (already)
-                positions["CE"] = {"side": "SELL", "qty": QTY_PER_LEG, "entry": float(ce_price), "strike": atm, "expiry": expiry}
-                positions["PE"] = {"side": "SELL", "qty": QTY_PER_LEG, "entry": float(pe_price), "strike": atm, "expiry": expiry}
+                positions["CE"] = {"side": "SELL", "qty": QTY_PER_LEG, "entry": float(ce_price), "strike": atm, "expiry": str(expiry)}
+                positions["PE"] = {"side": "SELL", "qty": QTY_PER_LEG, "entry": float(pe_price), "strike": atm, "expiry": str(expiry)}
 
                 unreal = compute_unreal_m2m(kite, positions, ce_inst, pe_inst)
 
@@ -881,6 +1035,9 @@ def main():
                     pe_ltp=float(pe_price),
                     ce_strike=ce_strk,
                     pe_strike=pe_strk,
+                    ce_symbol=ce_ts,
+                    pe_symbol=pe_ts,
+                    opt_expiry=str(expiry),
                 )
 
                 log_db(
@@ -901,6 +1058,9 @@ def main():
                     pe_ltp=float(pe_price),
                     ce_strike=ce_strk,
                     pe_strike=pe_strk,
+                    ce_symbol=ce_ts,
+                    pe_symbol=pe_ts,
+                    opt_expiry=str(expiry),
                 )
 
                 log_db(
@@ -921,6 +1081,9 @@ def main():
                     pe_ltp=float(pe_price),
                     ce_strike=ce_strk,
                     pe_strike=pe_strk,
+                    ce_symbol=ce_ts,
+                    pe_symbol=pe_ts,
+                    opt_expiry=str(expiry),
                 )
 
         time.sleep(POLL_INTERVAL_SEC)
