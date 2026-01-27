@@ -15,6 +15,11 @@ SS NIFTY FUT – ATM SHORT STRADDLE (Railway Deployable) – FUT ONLY
 ✅ NO API calls + NO DB writes outside market session (before 09:15 / after 15:30), weekends, holidays
 ✅ PAPER mode won’t fail without Stocko credentials
 
+🆕 FIX ADDED:
+✅ Stores BOTH CE and PE strikes in DB columns:
+   - ce_strike (INT)
+   - pe_strike (INT)
+
 DB table (default): live_ss_nifty_fut
 Kill switch table: trade_flag, column: live_ss_nifty_fut
 
@@ -167,12 +172,17 @@ def ensure_table(conn):
                 atr NUMERIC,
                 unreal_pnl NUMERIC,
                 total_pnl NUMERIC,
+
                 ce_entry_price NUMERIC,
                 pe_entry_price NUMERIC,
                 ce_ltp NUMERIC,
                 pe_ltp NUMERIC,
                 ce_exit_price NUMERIC,
-                pe_exit_price NUMERIC
+                pe_exit_price NUMERIC,
+
+                -- 🆕 strikes stored explicitly
+                ce_strike INT,
+                pe_strike INT
             );
         """).format(t=sql.Identifier(TABLE_NAME)))
 
@@ -183,6 +193,8 @@ def ensure_table(conn):
             ("pe_ltp", "NUMERIC"),
             ("ce_exit_price", "NUMERIC"),
             ("pe_exit_price", "NUMERIC"),
+            ("ce_strike", "INT"),
+            ("pe_strike", "INT"),
         ]:
             c.execute(
                 sql.SQL("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS {c} " + coltype).format(
@@ -267,6 +279,8 @@ def log_db(
     pe_ltp=None,
     ce_exit=None,
     pe_exit=None,
+    ce_strike=None,
+    pe_strike=None,
 ):
     with conn.cursor() as c:
         c.execute(sql.SQL("""
@@ -277,10 +291,11 @@ def log_db(
               spot, atr, unreal_pnl, total_pnl,
               ce_entry_price, pe_entry_price,
               ce_ltp, pe_ltp,
-              ce_exit_price, pe_exit_price
+              ce_exit_price, pe_exit_price,
+              ce_strike, pe_strike
             )
             VALUES
-            (NOW(), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            (NOW(), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """).format(t=sql.Identifier(TABLE_NAME)), (
             BOT_NAME,
             "LIVE" if LIVE_MODE else "PAPER",
@@ -300,6 +315,8 @@ def log_db(
             float(pe_ltp) if pe_ltp is not None else None,
             float(ce_exit) if ce_exit is not None else None,
             float(pe_exit) if pe_exit is not None else None,
+            int(ce_strike) if ce_strike is not None else None,
+            int(pe_strike) if pe_strike is not None else None,
         ))
     conn.commit()
 
@@ -547,7 +564,7 @@ def compute_unreal_m2m(kite: KiteConnect, positions: dict, ce_inst: str, pe_inst
 
 def square_off(conn, kite: KiteConnect, positions: dict, ce_ts: str, pe_ts: str,
                underlying_fut: float, atr: float | None, reason: str, event: str):
-    """Exit both legs and log exit prices + include entry prices."""
+    """Exit both legs and log exit prices + include entry prices + strikes."""
     if not positions:
         return
 
@@ -557,6 +574,8 @@ def square_off(conn, kite: KiteConnect, positions: dict, ce_ts: str, pe_ts: str,
 
     ce_entry = positions.get("CE", {}).get("entry")
     pe_entry = positions.get("PE", {}).get("entry")
+    ce_strk  = positions.get("CE", {}).get("strike")
+    pe_strk  = positions.get("PE", {}).get("strike")
 
     for leg, tsym, inst, offset in [("CE", ce_ts, ce_inst, 0), ("PE", pe_ts, pe_inst, 1)]:
         if leg not in positions:
@@ -590,6 +609,8 @@ def square_off(conn, kite: KiteConnect, positions: dict, ce_ts: str, pe_ts: str,
             pe_ltp=ltps.get(pe_inst) if not math.isnan(ltps.get(pe_inst, float("nan"))) else None,
             ce_exit=exit_price if leg == "CE" else None,
             pe_exit=exit_price if leg == "PE" else None,
+            ce_strike=ce_strk,
+            pe_strike=pe_strk,
         )
 
     log_db(
@@ -608,6 +629,8 @@ def square_off(conn, kite: KiteConnect, positions: dict, ce_ts: str, pe_ts: str,
         pe_entry=pe_entry,
         ce_exit=ltps.get(ce_inst) if not math.isnan(ltps.get(ce_inst, float("nan"))) else None,
         pe_exit=ltps.get(pe_inst) if not math.isnan(ltps.get(pe_inst, float("nan"))) else None,
+        ce_strike=ce_strk,
+        pe_strike=pe_strk,
     )
 
     positions.clear()
@@ -635,7 +658,7 @@ def should_enter(now: datetime, underlying_fut: float, positions: dict) -> tuple
 def main():
     conn = db_connect()
     ensure_table(conn)
-    ensure_trade_flag(conn)  # ✅ creates trade_flag + live_ss_nifty_fut column + row id=1
+    ensure_trade_flag(conn)
     kite = kite_connect()
 
     nfo_df = load_instruments_once(kite)
@@ -697,9 +720,21 @@ def main():
             if positions and ce_ts and pe_ts:
                 square_off(conn, kite, positions, ce_ts, pe_ts, underlying, last_atr, "TIME_1525", "TIME_EXIT")
             else:
-                log_db(conn, event="TIME_EXIT", reason="TIME_1525_NO_POS",
-                       symbol="ALL", side="NA", qty=0, price=0,
-                       underlying_fut=underlying, atr=last_atr, unreal=0.0, total=0.0)
+                log_db(
+                    conn,
+                    event="TIME_EXIT",
+                    reason="TIME_1525_NO_POS",
+                    symbol="ALL",
+                    side="NA",
+                    qty=0,
+                    price=0,
+                    underlying_fut=underlying,
+                    atr=last_atr,
+                    unreal=0.0,
+                    total=0.0,
+                    ce_strike=None,
+                    pe_strike=None,
+                )
             print("[STOP] 15:25 square-off executed. Exiting process.")
             return
 
@@ -709,6 +744,8 @@ def main():
 
             ce_entry = positions.get("CE", {}).get("entry") if positions else None
             pe_entry = positions.get("PE", {}).get("entry") if positions else None
+            ce_strk  = positions.get("CE", {}).get("strike") if positions else None
+            pe_strk  = positions.get("PE", {}).get("strike") if positions else None
 
             ce_inst = f"NFO:{ce_ts}" if ce_ts else None
             pe_inst = f"NFO:{pe_ts}" if pe_ts else None
@@ -740,6 +777,8 @@ def main():
                 pe_entry=pe_entry,
                 ce_ltp=ce_ltp,
                 pe_ltp=pe_ltp,
+                ce_strike=ce_strk,
+                pe_strike=pe_strk,
             )
 
             last_snapshot_ts = time.time()
@@ -752,9 +791,21 @@ def main():
             # Resume logic
             if trade_allowed_cached and trading_halted and not positions:
                 trading_halted = False
-                log_db(conn, event="RESUME", reason="FLAG_TRUE_RESUME",
-                       symbol="ALL", side="NA", qty=0, price=0,
-                       underlying_fut=underlying, atr=last_atr, unreal=0.0, total=0.0)
+                log_db(
+                    conn,
+                    event="RESUME",
+                    reason="FLAG_TRUE_RESUME",
+                    symbol="ALL",
+                    side="NA",
+                    qty=0,
+                    price=0,
+                    underlying_fut=underlying,
+                    atr=last_atr,
+                    unreal=0.0,
+                    total=0.0,
+                    ce_strike=None,
+                    pe_strike=None,
+                )
 
         # ---- If halted, do not enter ----
         if trading_halted:
@@ -803,25 +854,74 @@ def main():
                     stocko_place_by_tradingsymbol(ce_ts, "SELL", QTY_PER_LEG, offset=1)
                     stocko_place_by_tradingsymbol(pe_ts, "SELL", QTY_PER_LEG, offset=2)
 
+                # store strike+expiry in memory (already)
                 positions["CE"] = {"side": "SELL", "qty": QTY_PER_LEG, "entry": float(ce_price), "strike": atm, "expiry": expiry}
                 positions["PE"] = {"side": "SELL", "qty": QTY_PER_LEG, "entry": float(pe_price), "strike": atm, "expiry": expiry}
 
                 unreal = compute_unreal_m2m(kite, positions, ce_inst, pe_inst)
 
-                log_db(conn, event="ENTRY", reason=why, symbol=ce_inst, side="SELL",
-                       qty=QTY_PER_LEG, price=ce_price,
-                       underlying_fut=underlying, atr=last_atr, unreal=unreal, total=unreal,
-                       ce_entry=ce_price, pe_entry=pe_price, ce_ltp=float(ce_price), pe_ltp=float(pe_price))
+                ce_strk = positions["CE"]["strike"]
+                pe_strk = positions["PE"]["strike"]
 
-                log_db(conn, event="ENTRY", reason=why, symbol=pe_inst, side="SELL",
-                       qty=QTY_PER_LEG, price=pe_price,
-                       underlying_fut=underlying, atr=last_atr, unreal=unreal, total=unreal,
-                       ce_entry=ce_price, pe_entry=pe_price, ce_ltp=float(ce_price), pe_ltp=float(pe_price))
+                log_db(
+                    conn,
+                    event="ENTRY",
+                    reason=why,
+                    symbol=ce_inst,
+                    side="SELL",
+                    qty=QTY_PER_LEG,
+                    price=ce_price,
+                    underlying_fut=underlying,
+                    atr=last_atr,
+                    unreal=unreal,
+                    total=unreal,
+                    ce_entry=ce_price,
+                    pe_entry=pe_price,
+                    ce_ltp=float(ce_price),
+                    pe_ltp=float(pe_price),
+                    ce_strike=ce_strk,
+                    pe_strike=pe_strk,
+                )
 
-                log_db(conn, event="ENTRY_ALL", reason=f"{why},EXP={expiry}", symbol="ALL", side="NA",
-                       qty=0, price=0,
-                       underlying_fut=underlying, atr=last_atr, unreal=unreal, total=unreal,
-                       ce_entry=ce_price, pe_entry=pe_price, ce_ltp=float(ce_price), pe_ltp=float(pe_price))
+                log_db(
+                    conn,
+                    event="ENTRY",
+                    reason=why,
+                    symbol=pe_inst,
+                    side="SELL",
+                    qty=QTY_PER_LEG,
+                    price=pe_price,
+                    underlying_fut=underlying,
+                    atr=last_atr,
+                    unreal=unreal,
+                    total=unreal,
+                    ce_entry=ce_price,
+                    pe_entry=pe_price,
+                    ce_ltp=float(ce_price),
+                    pe_ltp=float(pe_price),
+                    ce_strike=ce_strk,
+                    pe_strike=pe_strk,
+                )
+
+                log_db(
+                    conn,
+                    event="ENTRY_ALL",
+                    reason=f"{why},EXP={expiry}",
+                    symbol="ALL",
+                    side="NA",
+                    qty=0,
+                    price=0,
+                    underlying_fut=underlying,
+                    atr=last_atr,
+                    unreal=unreal,
+                    total=unreal,
+                    ce_entry=ce_price,
+                    pe_entry=pe_price,
+                    ce_ltp=float(ce_price),
+                    pe_ltp=float(pe_price),
+                    ce_strike=ce_strk,
+                    pe_strike=pe_strk,
+                )
 
         time.sleep(POLL_INTERVAL_SEC)
 
