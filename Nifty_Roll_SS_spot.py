@@ -2,27 +2,28 @@
 # -*- coding: utf-8 -*-
 
 """
-SS NIFTY SPOT – ATM SHORT STRADDLE (Railway Deployable) – FINAL FIXED
---------------------------------------------------------------------
+SS NIFTY SPOT – ATM SHORT STRADDLE (Railway Deployable) – FINAL + ATM ROLLING
+---------------------------------------------------------------------------
 ✅ FUT-based ATR (built live from NIFTY FUT minute candle builder)
-✅ Restored entry logic (SELL ATM CE+PE) after ENTRY_START_TIME and within ±ENTRY_TOL
-✅ Kill-switch every minute from trade_flag.live_ss_nifty_spot
-   - If FALSE while trade open -> immediate square-off + halt
-   - Resume when TRUE again (and no positions)
+✅ Entry logic (SELL ATM CE+PE) after ENTRY_START_TIME and within ±ENTRY_TOL
+✅ Kill-switch every minute from trade_flag.<FLAG_COL> (READ ONLY)
 ✅ M2M snapshots every minute to DB with:
    - CE/PE entry price
    - CE/PE LTP
    - CE/PE exit price (filled on exit events)
 ✅ Entry/Exit transactions stored in DB too
 ✅ Forced square-off at 15:25
-✅ NO API calls + NO DB writes outside market session (before 09:15 / after 15:30), weekends, holidays
+✅ NO API calls + NO DB writes outside market session (before MARKET_OPEN / after MARKET_CLOSE),
+   weekends, holidays
 ✅ PAPER mode won’t fail without Stocko credentials
 
-DB table (default): live_ss_nifty_spot
-Kill switch table: trade_flag, column: live_ss_nifty_spot
-
-IMPORTANT:
-- CIRCUIT_STOP_LOSS uses magnitude. For -4000 loss circuit, set CIRCUIT_STOP_LOSS=4000
+🆕 ADDED (as requested):
+✅ ATM Rolling on STRIKE_STEP (default 50):
+   - If (new_atm != active_atm) AND spot is within ±ENTRY_TOL of new_atm:
+       EXIT old ATM CE+PE
+       ENTER new ATM CE+PE (nearest expiry >= today)
+   - If new_atm == active_atm: do nothing
+   - Uses existing STRIKE_STEP + ENTRY_TOL only (NO new env vars)
 """
 
 import os
@@ -175,7 +176,6 @@ def ensure_table(conn):
             );
         """).format(t=sql.Identifier(TABLE_NAME)))
 
-        # Safe for older tables: add columns if missing (Postgres supports IF NOT EXISTS)
         for col, coltype in [
             ("ce_entry_price", "NUMERIC"),
             ("pe_entry_price", "NUMERIC"),
@@ -391,21 +391,19 @@ def resolve_atm_ce_pe(nfo_df: pd.DataFrame, atm: int, today: date) -> tuple[str,
         raise RuntimeError(f"Could not resolve CE/PE for strike={atm} expiry={expiry}")
 
     return str(ce.iloc[0]["tradingsymbol"]), str(pe.iloc[0]["tradingsymbol"]), str(expiry)
+
 # =========================================================
-# ATR BUILDER (FUT minute candle builder) – FIXED
+# ATR BUILDER (FUT minute candle builder)
 # =========================================================
 
 class FutAtrBuilder:
     def __init__(self, atr_period: int):
         self.atr_period = atr_period
         self.tr_history = []
-
-        # minute candle state
         self.last_minute_key = None
         self.minute_high = None
         self.minute_low = None
         self.minute_close = None
-
         self.prev_close = None
         self.atr_val = None
 
@@ -413,10 +411,8 @@ class FutAtrBuilder:
         if fut_ltp is None or math.isnan(fut_ltp):
             return self.atr_val
 
-        # full minute key (safe across hour change)
         minute_key = now.replace(second=0, microsecond=0)
 
-        # first tick ever
         if self.last_minute_key is None:
             self.last_minute_key = minute_key
             self.minute_high = fut_ltp
@@ -425,14 +421,12 @@ class FutAtrBuilder:
             self.prev_close = fut_ltp
             return self.atr_val
 
-        # same minute → build candle
         if minute_key == self.last_minute_key:
             self.minute_high = max(self.minute_high, fut_ltp)
             self.minute_low = min(self.minute_low, fut_ltp)
             self.minute_close = fut_ltp
             return self.atr_val
 
-        # minute changed → finalize previous candle
         tr = max(
             self.minute_high - self.minute_low,
             abs(self.minute_high - self.prev_close),
@@ -441,13 +435,10 @@ class FutAtrBuilder:
         self.tr_history.append(tr)
 
         if len(self.tr_history) >= self.atr_period:
-            self.atr_val = round(
-                sum(self.tr_history[-self.atr_period:]) / self.atr_period, 2
-            )
+            self.atr_val = round(sum(self.tr_history[-self.atr_period:]) / self.atr_period, 2)
         else:
             self.atr_val = None
 
-        # move to new minute
         self.prev_close = self.minute_close
         self.last_minute_key = minute_key
         self.minute_high = fut_ltp
@@ -455,7 +446,6 @@ class FutAtrBuilder:
         self.minute_close = fut_ltp
 
         return self.atr_val
-
 
 # =========================================================
 # PNL / POSITIONS
@@ -494,7 +484,6 @@ def square_off(conn, kite: KiteConnect, positions: dict, ce_ts: str, pe_ts: str,
     ce_entry = positions.get("CE", {}).get("entry")
     pe_entry = positions.get("PE", {}).get("entry")
 
-    # Exit side for short straddle is BUY
     for leg, tsym, inst, offset in [("CE", ce_ts, ce_inst, 0), ("PE", pe_ts, pe_inst, 1)]:
         if leg not in positions:
             continue
@@ -507,7 +496,6 @@ def square_off(conn, kite: KiteConnect, positions: dict, ce_ts: str, pe_ts: str,
         if LIVE_MODE:
             stocko_place_by_tradingsymbol(tsym, exit_side, qty, offset=100 + offset)
 
-        # compute m2m just before clearing (for logging)
         unreal = compute_unreal_m2m(kite, positions, ce_inst, pe_inst)
 
         log_db(
@@ -530,7 +518,6 @@ def square_off(conn, kite: KiteConnect, positions: dict, ce_ts: str, pe_ts: str,
             pe_exit=exit_price if leg == "PE" else None,
         )
 
-    # Summary row
     log_db(
         conn,
         event=event,
@@ -582,7 +569,7 @@ def main():
 
     atr_builder = FutAtrBuilder(ATR_PERIOD)
 
-    positions = {}          # {"CE": {"side","qty","entry",...}, "PE": {...}}
+    positions = {}          # {"CE": {"side","qty","entry","strike","expiry"}, "PE": {...}}
     ce_ts = pe_ts = ""      # active traded symbols
     trading_halted = False
     trade_allowed_cached = False
@@ -713,6 +700,76 @@ def main():
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
+        # =====================================================
+        # 🆕 ATM ROLLING (NO NEW ENV VARS)
+        # Rule:
+        #   new_atm = round(spot/STRIKE_STEP)*STRIKE_STEP
+        #   if new_atm == active_atm -> do nothing
+        #   if new_atm != active_atm AND abs(spot-new_atm) <= ENTRY_TOL:
+        #       exit old CE+PE and enter new CE+PE
+        # =====================================================
+        if positions and ce_ts and pe_ts:
+            active_atm = int(positions.get("CE", {}).get("strike") or positions.get("PE", {}).get("strike") or 0)
+            new_atm = int(round(spot / STRIKE_STEP) * STRIKE_STEP)
+            new_diff = abs(spot - new_atm)
+
+            # If same strike -> do nothing
+            if new_atm != 0 and new_atm != active_atm and new_diff <= ENTRY_TOL:
+                # Exit old positions first
+                square_off(
+                    conn, kite, positions, ce_ts, pe_ts,
+                    spot, last_atr,
+                    reason=f"ATM_ROLL_{active_atm}_TO_{new_atm}_DIFF_{new_diff:.2f}",
+                    event="ROLL_EXIT"
+                )
+
+                # Re-check flag only if configured; else use cached
+                trade_allowed_now = trade_allowed_cached
+                if RECHECK_FLAG_ON_ENTRY:
+                    trade_allowed_now = read_trade_flag(conn)
+
+                # Enter new only if allowed and time >= entry start (also not past square-off)
+                if trade_allowed_now and now.time() >= ENTRY_START_TIME and now.time() < SQUARE_OFF_TIME:
+                    ce_ts, pe_ts, expiry = resolve_atm_ce_pe(nfo_df, new_atm, now.date())
+                    ce_inst = f"NFO:{ce_ts}"
+                    pe_inst = f"NFO:{pe_ts}"
+
+                    leg_ltps = safe_ltp_many(kite, [ce_inst, pe_inst])
+                    ce_price = leg_ltps.get(ce_inst, float("nan"))
+                    pe_price = leg_ltps.get(pe_inst, float("nan"))
+
+                    if not math.isnan(ce_price) and not math.isnan(pe_price):
+                        if LIVE_MODE:
+                            stocko_place_by_tradingsymbol(ce_ts, "SELL", QTY_PER_LEG, offset=21)
+                            stocko_place_by_tradingsymbol(pe_ts, "SELL", QTY_PER_LEG, offset=22)
+
+                        positions["CE"] = {"side": "SELL", "qty": QTY_PER_LEG, "entry": float(ce_price), "strike": new_atm, "expiry": expiry}
+                        positions["PE"] = {"side": "SELL", "qty": QTY_PER_LEG, "entry": float(pe_price), "strike": new_atm, "expiry": expiry}
+
+                        unreal2 = compute_unreal_m2m(kite, positions, ce_inst, pe_inst)
+
+                        log_db(
+                            conn,
+                            event="ROLL_ENTRY_ALL",
+                            reason=f"ROLLED_TO_{new_atm}_DIFF_{new_diff:.2f}_EXP={expiry}",
+                            symbol="ALL",
+                            side="NA",
+                            qty=0,
+                            price=0,
+                            spot=spot,
+                            atr=last_atr,
+                            unreal=unreal2,
+                            total=unreal2,
+                            ce_entry=ce_price,
+                            pe_entry=pe_price,
+                            ce_ltp=float(ce_price),
+                            pe_ltp=float(pe_price),
+                        )
+
+                # After roll processing, skip rest of loop
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
         # ---- Entry logic ----
         if not positions:
             enter, why, atm, diff = should_enter(now, spot, positions)
@@ -722,7 +779,6 @@ def main():
                 trade_allowed_now = read_trade_flag(conn)
 
             if enter and trade_allowed_now:
-                # Resolve ATM option symbols
                 ce_ts, pe_ts, expiry = resolve_atm_ce_pe(nfo_df, atm, now.date())
                 ce_inst = f"NFO:{ce_ts}"
                 pe_inst = f"NFO:{pe_ts}"
@@ -734,7 +790,6 @@ def main():
                     time.sleep(POLL_INTERVAL_SEC)
                     continue
 
-                # Place orders (SELL)
                 if LIVE_MODE:
                     stocko_place_by_tradingsymbol(ce_ts, "SELL", QTY_PER_LEG, offset=1)
                     stocko_place_by_tradingsymbol(pe_ts, "SELL", QTY_PER_LEG, offset=2)
@@ -744,7 +799,6 @@ def main():
 
                 unreal = compute_unreal_m2m(kite, positions, ce_inst, pe_inst)
 
-                # Log entry legs (entry prices stored)
                 log_db(conn, event="ENTRY", reason=why, symbol=ce_inst, side="SELL",
                        qty=QTY_PER_LEG, price=ce_price, spot=spot, atr=last_atr, unreal=unreal, total=unreal,
                        ce_entry=ce_price, pe_entry=pe_price, ce_ltp=float(ce_price), pe_ltp=float(pe_price))
