@@ -111,6 +111,8 @@ STRIKE_STEP = env_int("STRIKE_STEP", 50)
 ENTRY_TOL   = env_int("ENTRY_TOL", 25)
 QTY_PER_LEG = env_int("QTY_PER_LEG", 65)
 
+ALLOW_WEEKEND = env_bool("ALLOW_WEEKEND", False)
+
 PROFIT_TARGET     = env_float("PROFIT_TARGET", 0.0)      # 0 disables
 CIRCUIT_STOP_LOSS = env_float("CIRCUIT_STOP_LOSS", 0.0)  # 0 disables; set 4000 for -4000
 
@@ -334,7 +336,10 @@ def stocko_place_by_tradingsymbol(tradingsymbol: str, side: str, qty: int, offse
 # =========================================================
 
 def is_weekend(d: date) -> bool:
+    if ALLOW_WEEKEND:
+        return False
     return d.weekday() >= 5
+
 
 def is_holiday(d: date) -> bool:
     return d in NSE_HOLIDAYS
